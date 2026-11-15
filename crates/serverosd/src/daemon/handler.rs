@@ -403,6 +403,37 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             result
         }
 
+        Job::DatabaseQuery {
+            service,
+            engine,
+            database,
+            sql,
+            read_only,
+            count,
+            nonce,
+        } => {
+            let managed = managed(&app, &service).await?;
+            let grant = authorize(Operation::Service(ServiceOp::Exec {
+                service: managed.key.clone(),
+            }))?;
+            let query = super::database::Query {
+                engine: &engine,
+                database: database.as_deref(),
+                sql: &sql,
+                read_only,
+                count,
+                nonce: &nonce,
+            };
+            let result = super::database::query(&ctx, &managed, &query).await;
+            let summary = if read_only {
+                "database query (read-only)"
+            } else {
+                "database query"
+            };
+            grant.finish(&result.as_ref().map(|_| ()), Some(summary));
+            result
+        }
+
         Job::ServiceRemove {
             service,
             delete_data,
