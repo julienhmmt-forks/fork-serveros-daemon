@@ -29,10 +29,16 @@ impl Handler for JobHandler {
 
     fn known_secrets(&self, job: &Job) -> Vec<String> {
         match job {
-            Job::Deploy(spec) => spec.env.values().cloned().collect(),
+            Job::Deploy(spec) => deploy_secrets(spec),
             Job::Release(spec) => spec.repo_token.iter().map(|t| t.0.clone()).collect(),
             Job::BackupTo { destination, .. } => super::backup_ops::secrets(destination),
             Job::ServiceExec { .. } => daemon_services::exec::secrets(job),
+            // Only ever a hash, but there's no reason to keep it in logs.
+            Job::SiteOptions { options, .. } => options
+                .basic_auth
+                .iter()
+                .map(|auth| auth.hash.clone())
+                .collect(),
             // The token as sent and as used (trimmed), so neither form is
             // ever logged or kept.
             Job::Tunnel {
@@ -44,6 +50,18 @@ impl Handler for JobHandler {
             _ => Vec::new(),
         }
     }
+}
+
+/// A deploy's settings, repository token and registry passwords: scrubbed
+/// from the job kept in state.db and from its log.
+fn deploy_secrets(spec: &daemon_protocol::DeploySpec) -> Vec<String> {
+    spec.env
+        .values()
+        .cloned()
+        .chain(spec.repo_token.iter().map(|t| t.0.clone()))
+        .chain(spec.registries.iter().map(|r| r.password.0.clone()))
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Who asked for the job, and where from: the panel's job id always, and
@@ -1235,6 +1253,38 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             result
         }
 
+        Job::SiteOptions { service, options } => {
+            daemon_deploy::site_options::validate(&options)?;
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: service.clone(),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result = app
+                .deployer
+                .proxy()
+                .set_site_options(&service, &options, &mut cancel, &ctx.progress)
+                .await;
+            grant.finish(&result.as_ref().map(|_| ()), Some("site options"));
+            result
+        }
+
+        Job::Traffic { enabled } => {
+            let grant = authorize(Operation::Deploy(DeployOp::WriteProxyConfig {
+                service: "traffic".into(),
+            }))?;
+            let mut cancel = ctx.cancel.clone();
+            let result = app
+                .deployer
+                .proxy()
+                .set_traffic(enabled, &mut cancel, &ctx.progress)
+                .await;
+            grant.finish(
+                &result.as_ref().map(|_| ()),
+                Some(if enabled { "on" } else { "off" }),
+            );
+            result
+        }
+
         Job::SshKey {
             user,
             action,
@@ -1347,3 +1397,23 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
 
 #[allow(dead_code)]
 fn _keep(_: &Path) {}
+
+#[cfg(test)]
+mod secret_tests {
+    use super::deploy_secrets;
+
+    #[test]
+    fn deploy_secrets_cover_registry_passwords_and_the_repo_token() {
+        let spec: daemon_protocol::DeploySpec = serde_json::from_value(serde_json::json!({
+            "service": "web",
+            "commit": "abc",
+            "env": {"APP_KEY": "base64:k"},
+            "repo_token": "ghs_token",
+            "registries": [{"host": "ghcr.io", "username": "acme", "password": "ghp_secret"}],
+        }))
+        .unwrap();
+        let mut secrets = deploy_secrets(&spec);
+        secrets.sort();
+        assert_eq!(secrets, ["base64:k", "ghp_secret", "ghs_token"]);
+    }
+}

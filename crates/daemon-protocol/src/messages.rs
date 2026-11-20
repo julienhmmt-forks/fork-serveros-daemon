@@ -281,6 +281,44 @@ pub struct TelemetryBatch {
     pub backfill: bool,
     #[serde(default)]
     pub gap_before: bool,
+    /// Per-site traffic rollups, for machines with traffic on. Left out
+    /// when there are none, so the batch reads as it always did.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub traffic: Vec<TrafficRollup>,
+}
+
+/// One site's traffic in one whole minute, rolled up on the machine. Sent
+/// once, when the minute is over. Nothing in it identifies a visitor.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct TrafficRollup {
+    /// The site's file stem: the app's name with anything but letters,
+    /// digits, `-` and `_` turned into `-`.
+    pub site: String,
+    /// Unix time of the minute's start.
+    pub minute: i64,
+    pub requests: u64,
+    pub status_2xx: u64,
+    pub status_3xx: u64,
+    pub status_4xx: u64,
+    pub status_5xx: u64,
+    /// Response bytes sent.
+    pub bytes: u64,
+    #[serde(default)]
+    pub p50_ms: Option<f32>,
+    #[serde(default)]
+    pub p95_ms: Option<f32>,
+    /// Visitors first seen today (UTC) in this minute, so a day's minutes
+    /// add up to its unique visitors. Counted from a hash of IP and user
+    /// agent with a salt that changes every day and never leaves the
+    /// machine.
+    pub visitors: u64,
+    /// The most requested paths, without query strings, with counts.
+    #[serde(default)]
+    pub paths: Vec<(String, u64)>,
+    /// The hosts of the most common referrers (other sites only), with
+    /// counts.
+    #[serde(default)]
+    pub referrers: Vec<(String, u64)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -888,6 +926,64 @@ pub enum Job {
         #[serde(default)]
         token: Option<String>,
     },
+    /// An app's site switches: a maintenance page, a password in front of
+    /// it and redirects, as exactly these (each job replaces the last).
+    /// Applied to the app's site at once, with no redeploy, and kept
+    /// through later deploys, proxy switches and tunnels. A job of its
+    /// own, so a daemon that predates it refuses it instead of ignoring it.
+    SiteOptions {
+        service: String,
+        #[serde(default)]
+        options: SiteOptions,
+    },
+    /// Traffic for every site ServerOS runs here, on or off: the proxy
+    /// writes access logs that the daemon rolls up per site and minute and
+    /// reports with telemetry. Raw lines, IPs and user agents never leave
+    /// the machine. A job of its own, so an older daemon refuses it.
+    Traffic {
+        enabled: bool,
+    },
+}
+
+/// The switches on one app's site. All off is a plain site.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SiteOptions {
+    /// Visitors get a "back soon" page (503) while the app keeps running
+    /// behind it.
+    #[serde(default)]
+    pub maintenance: bool,
+    /// The maintenance page's HTML, instead of the plain default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_html: Option<String>,
+    /// A username and password in front of the site (HTTP basic auth).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<BasicAuth>,
+    /// Also answer on the first domain's www name (or its bare name, for a
+    /// www domain) and send visitors there to the first domain.
+    #[serde(default)]
+    pub www_redirect: bool,
+    /// Paths sent somewhere else, checked before the app sees them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirects: Vec<PathRedirect>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BasicAuth {
+    pub user: String,
+    /// The password's bcrypt hash. The password itself never leaves the
+    /// panel.
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PathRedirect {
+    /// An exact path on the site, like `/old-pricing`.
+    pub from: String,
+    /// A path on the same site (`/pricing`) or a full http(s) address.
+    pub to: String,
+    /// 301 when true, 302 when false.
+    #[serde(default = "default_true")]
+    pub permanent: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1037,6 +1133,53 @@ pub struct DeploySpec {
     /// `compose_file` is a path already. Missing builds from the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_dir: Option<String>,
+    /// CPU and memory limits for the app's container (docker run --cpus
+    /// and --memory). Missing runs it without limits, as before. Compose
+    /// deploys don't apply them; the result's `limits` says what was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<ResourceLimits>,
+    /// Registry logins for pulling private images during this deploy only
+    /// (a Dockerfile's FROM, a Compose file's images). They're written to a
+    /// Docker config made for the job and removed with it, never to the
+    /// machine's own, and never stored or logged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registries: Vec<RegistryLogin>,
+}
+
+/// Limits on what an app's container may use.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Thousandths of a CPU: 500 is half a CPU, 2000 is two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_millis: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<u64>,
+}
+
+impl ResourceLimits {
+    pub fn is_empty(&self) -> bool {
+        self.cpu_millis.is_none() && self.memory_mb.is_none()
+    }
+}
+
+/// A login for a container registry: Docker Hub (`docker.io`), GitHub's
+/// (`ghcr.io`) or a self-hosted one (`registry.example.com:5000`). Its
+/// Debug leaves the password out, so a logged spec doesn't leak it.
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RegistryLogin {
+    pub host: String,
+    pub username: String,
+    pub password: RepoToken,
+}
+
+impl std::fmt::Debug for RegistryLogin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryLogin")
+            .field("host", &self.host)
+            .field("username", &self.username)
+            .field("password", &"[redacted]")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1317,6 +1460,39 @@ mod tests {
     }
 
     #[test]
+    fn traffic_is_a_job_of_its_own_and_rides_on_telemetry() {
+        let job: Job = serde_json::from_str(r#"{"type":"traffic","enabled":true}"#).unwrap();
+        assert_eq!(job, Job::Traffic { enabled: true });
+
+        // A batch without traffic reads and writes as it always did.
+        let old: TelemetryBatch = serde_json::from_str(r#"{"samples":[]}"#).unwrap();
+        assert!(old.traffic.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("traffic"));
+
+        let batch = TelemetryBatch {
+            samples: Vec::new(),
+            backfill: false,
+            gap_before: false,
+            traffic: vec![TrafficRollup {
+                site: "shop".into(),
+                minute: 1763640000,
+                requests: 3,
+                status_2xx: 3,
+                p95_ms: Some(12.5),
+                paths: vec![("/".into(), 3)],
+                ..Default::default()
+            }],
+        };
+        let json = serde_json::to_value(&batch).unwrap();
+        assert_eq!(json["traffic"][0]["site"], "shop");
+        assert_eq!(json["traffic"][0]["paths"][0][0], "/");
+        assert_eq!(json["traffic"][0]["paths"][0][1], 3);
+        assert_eq!(json["traffic"][0]["p50_ms"], serde_json::Value::Null);
+        let back: TelemetryBatch = serde_json::from_value(json).unwrap();
+        assert_eq!(back, batch);
+    }
+
+    #[test]
     fn resolve_ref_jobs_name_the_ref_ref() {
         let raw = serde_json::json!({
             "type": "resolve_ref",
@@ -1364,6 +1540,41 @@ mod tests {
             panic!("not a deploy");
         };
         assert_eq!(spec.base_dir.as_deref(), Some("apps/web"));
+    }
+
+    #[test]
+    fn deploy_jobs_carry_limits_and_registry_logins_only_when_given() {
+        let raw = serde_json::json!({"type": "deploy", "service": "web", "commit": "abc"});
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        assert_eq!(spec.limits, None);
+        assert!(spec.registries.is_empty());
+        let json = serde_json::to_value(&*spec).unwrap();
+        assert!(json.get("limits").is_none() && json.get("registries").is_none());
+
+        let raw = serde_json::json!({
+            "type": "deploy",
+            "service": "web",
+            "commit": "abc",
+            "limits": {"cpu_millis": 500, "memory_mb": 512},
+            "registries": [{"host": "ghcr.io", "username": "acme", "password": "ghp_secret"}],
+        });
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        assert_eq!(
+            spec.limits,
+            Some(ResourceLimits {
+                cpu_millis: Some(500),
+                memory_mb: Some(512)
+            })
+        );
+        assert_eq!(spec.registries[0].host, "ghcr.io");
+        assert_eq!(spec.registries[0].password.0, "ghp_secret");
+        let logged = format!("{spec:?}");
+        assert!(logged.contains("ghcr.io") && !logged.contains("ghp_secret"));
+        assert!(ResourceLimits::default().is_empty());
     }
 
     #[test]
