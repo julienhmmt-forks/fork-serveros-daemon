@@ -69,6 +69,25 @@ impl Deployer {
         git::ensure_deploy_key(&self.keys_dir(), service, progress).await
     }
 
+    /// The commit `git_ref` (a branch or tag, or the default branch when
+    /// missing) points at in `repo`, asked over the service's deploy key.
+    pub async fn resolve_ref(
+        &self,
+        service: &str,
+        repo: &str,
+        git_ref: Option<&str>,
+        cancel: &mut watch::Receiver<bool>,
+    ) -> Result<git::ResolvedRef, Failure> {
+        let (private_key, _) = git::key_paths(&self.keys_dir(), service);
+        git::resolve_ref(
+            repo,
+            git_ref,
+            private_key.exists().then_some(private_key.as_path()),
+            cancel,
+        )
+        .await
+    }
+
     fn write_env(
         &self,
         service: &str,
@@ -118,6 +137,7 @@ impl Deployer {
         let service = spec.service.clone();
         let commit = spec.commit.clone();
         let previous = ledger.current(&service);
+        let slot = slot_for(&service, &commit, previous.as_ref());
 
         progress.phase("prepare", Some(5)).await;
         let workspace = self.paths.jobs_dir().join(ctx.id.to_string());
@@ -125,7 +145,7 @@ impl Deployer {
             .map_err(|e| Failure::new("prepare", format!("could not create workspace: {e}")))?;
 
         let result = self
-            .deploy_inner(ctx, spec, &workspace, previous.as_ref(), &mut cancel)
+            .deploy_inner(ctx, spec, &workspace, previous.as_ref(), &slot, &mut cancel)
             .await;
 
         let _ = std::fs::remove_dir_all(&workspace);
@@ -133,8 +153,14 @@ impl Deployer {
         match result {
             Ok(result) => Ok(result),
             Err(failure) => {
-                let _ = ledger.mark_failed(&service, &commit);
-                container::remove(&container::container_name(&service, &commit), progress).await;
+                // The live commit deployed again failed beside it: that
+                // release is still serving, so it isn't marked failed.
+                let live_again = spec.compose_file.is_none()
+                    && previous.as_ref().is_some_and(|p| p.commit == commit);
+                if !live_again {
+                    let _ = ledger.mark_failed(&service, &commit);
+                }
+                container::remove(&slot.name, progress).await;
                 if let Some(prev) = &previous {
                     progress
                         .line(format!(
@@ -155,15 +181,38 @@ impl Deployer {
         spec: &DeploySpec,
         workspace: &Path,
         previous: Option<&Release>,
+        slot: &Slot,
         cancel: &mut watch::Receiver<bool>,
     ) -> Result<DeployResult, Failure> {
         let progress = &ctx.progress;
         let service = &spec.service;
         let commit = &spec.commit;
         let step_timeout = ctx.timeout;
+        // An app in a subfolder builds from there; a Compose file names
+        // its own path, so it builds from the repository's root.
+        let base_dir = match (&spec.compose_file, &spec.base_dir) {
+            (None, Some(dir)) => Some(base_dir_path(dir)?),
+            _ => None,
+        };
+
+        // An image already built from these same files (the live commit
+        // redeployed for an env change, say) is used as it is.
+        let tag = container::image_tag(service, commit);
+        let fingerprint = build_fingerprint(spec);
+        let built = spec.compose_file.is_none()
+            && container::image_label(&tag, container::BUILD_LABEL)
+                .await
+                .is_some_and(|label| label == fingerprint);
 
         progress.phase("fetch", Some(15)).await;
-        if spec.repo.is_empty() {
+        if built {
+            progress
+                .line(format!(
+                    "image for {} is already built with the same files; skipping the build",
+                    &commit[..7.min(commit.len())]
+                ))
+                .await;
+        } else if spec.repo.is_empty() {
             if spec.files.is_empty() {
                 return Err(
                     Failure::new("fetch", "nothing to deploy: no repository and no files")
@@ -189,7 +238,13 @@ impl Deployer {
             )
             .await?;
         }
-        write_files(workspace, &spec.files)?;
+        let context = if built {
+            None
+        } else {
+            let context = build_context(workspace, base_dir, commit, !spec.repo.is_empty())?;
+            write_files(&context, &spec.files)?;
+            Some(context)
+        };
 
         progress.phase("env", Some(25)).await;
         let env_file = self.write_env(service, commit, &spec.env)?;
@@ -235,6 +290,7 @@ impl Deployer {
                 deployed_at: daemon_state::State::now(),
                 status: "live".into(),
                 http: spec.health.is_some(),
+                compose: true,
             };
             ReleaseLedger::new(&self.state)
                 .promote(service, release.clone(), RETAINED_RELEASES)
@@ -252,21 +308,31 @@ impl Deployer {
         }
 
         progress.phase("build", Some(40)).await;
-        let tag = container::image_tag(service, commit);
-        container::build(
-            workspace,
-            spec.dockerfile.as_deref(),
-            &tag,
-            &self.build_limits,
-            step_timeout,
-            cancel,
-            progress,
-        )
-        .await?;
+        if let Some(context) = &context {
+            container::build(
+                context,
+                spec.dockerfile.as_deref(),
+                &tag,
+                &fingerprint,
+                &self.build_limits,
+                step_timeout,
+                cancel,
+                progress,
+            )
+            .await?;
+        }
 
         progress.phase("start", Some(60)).await;
-        let name = container::container_name(service, commit);
-        let host_port = releases::port_for(service, commit);
+        let name = slot.name.clone();
+        let host_port = slot.port;
+        if previous.is_some_and(|p| p.commit == *commit) {
+            progress
+                .line(format!(
+                    "{} is live already: starting it again beside itself as {name}, so it keeps serving until the swap",
+                    &commit[..7.min(commit.len())]
+                ))
+                .await;
+        }
         let container_port = spec.port.unwrap_or(80);
 
         // Folders the Dockerfile declares with VOLUME are the app's data:
@@ -335,6 +401,7 @@ impl Deployer {
             deployed_at: daemon_state::State::now(),
             status: "live".into(),
             http: spec.health.is_some(),
+            compose: false,
         };
         let evicted = ledger
             .promote(service, release, RETAINED_RELEASES)
@@ -352,6 +419,11 @@ impl Deployer {
                         prev.container, e.message
                     ))
                     .await;
+            }
+            // The same commit's other container: the ledger now holds
+            // the new one for this commit, so the old one is let go.
+            if prev.commit == *commit {
+                container::remove(&prev.container, progress).await;
             }
         }
 
@@ -411,6 +483,7 @@ impl Deployer {
         let mut cancel = ctx.cancel.clone();
         let ledger = ReleaseLedger::new(&self.state);
         let current = ledger.current(service);
+        refuse_compose(current.as_ref())?;
         let all = ledger.load(service);
 
         let release = match target {
@@ -425,6 +498,7 @@ impl Deployer {
             Failure::new("rollback", "no previous release to roll back to")
                 .with_next_step("Deploy a new commit instead.")
         })?;
+        refuse_compose(Some(&release))?;
 
         if current.as_ref().is_some_and(|c| c.commit == release.commit) {
             return Err(Failure::new(
@@ -487,9 +561,58 @@ impl Deployer {
     }
 }
 
+/// A Compose release is recorded under its project's name, which isn't a
+/// container, and Compose recreates the stack in place, so there's nothing
+/// stopped to start again. Checked before anything is touched.
+fn refuse_compose(release: Option<&Release>) -> Result<(), Failure> {
+    match release {
+        Some(release) if release.is_compose() => Err(Failure::new(
+            "rollback",
+            "Compose apps roll back by deploying the earlier commit again",
+        )
+        .with_next_step("Deploy the commit you want to go back to.")),
+        _ => Ok(()),
+    }
+}
+
+/// Where a release runs: its container and the local port it listens on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Slot {
+    name: String,
+    port: u16,
+}
+
+/// A commit runs as a container named for it, on a port of its own. When
+/// it's the commit that's live (an env change redeploys the same commit),
+/// that name and port are taken, so it starts under its other name and
+/// port beside the live one, which serves until the new one is healthy and
+/// the proxy has moved over, as on any deploy. The next time, it goes back
+/// to the first.
+fn slot_for(service: &str, commit: &str, previous: Option<&Release>) -> Slot {
+    let first = Slot {
+        name: container::container_name(service, commit),
+        port: releases::port_for(service, commit),
+    };
+    let second = Slot {
+        name: container::alternate_container_name(service, commit),
+        port: releases::alternate_port(service, commit),
+    };
+    let Some(prev) = previous else {
+        return first;
+    };
+    let taken = |slot: &Slot| prev.container == slot.name || prev.port == slot.port;
+    if !taken(&first) {
+        first
+    } else if !taken(&second) || prev.container == first.name {
+        second
+    } else {
+        first
+    }
+}
+
 /// The release to stop once the new one is live: the one before it, unless
-/// it was the same commit deployed again, whose container the new one has
-/// already replaced (same name), so stopping it would take the app down.
+/// it has the new one's name, in which case the new one already replaced
+/// it and stopping it would take the app down.
 fn to_drain<'a>(previous: Option<&'a Release>, container: &str) -> Option<&'a Release> {
     previous.filter(|prev| prev.container != container)
 }
@@ -507,6 +630,115 @@ fn replace_dir(workspace: &Path, dir: &Path) -> Result<(), Failure> {
     }
     std::fs::create_dir_all(dir.parent().unwrap()).map_err(fail)?;
     std::fs::rename(workspace, dir).map_err(fail)
+}
+
+/// What an app's image is built from, as a hex sha256: the repository and
+/// commit, the Dockerfile, the job's files and the app's folder. Each part
+/// is written with its length first, so no two sets of inputs run together
+/// into the same bytes.
+fn build_fingerprint(spec: &DeploySpec) -> String {
+    use sha2::{Digest, Sha256};
+
+    fn field(hash: &mut Sha256, value: &str) {
+        hash.update((value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    fn optional(hash: &mut Sha256, value: Option<&str>) {
+        match value {
+            Some(value) => {
+                hash.update([1]);
+                field(hash, value);
+            }
+            None => hash.update([0]),
+        }
+    }
+
+    let mut hash = Sha256::new();
+    field(&mut hash, "serveros.build/1");
+    field(&mut hash, &spec.repo);
+    field(&mut hash, &spec.commit);
+    optional(&mut hash, spec.dockerfile.as_deref());
+    hash.update((spec.files.len() as u64).to_le_bytes());
+    for (name, content) in &spec.files {
+        field(&mut hash, name);
+        field(&mut hash, content);
+    }
+    optional(&mut hash, spec.base_dir.as_deref());
+    hex::encode(hash.finalize())
+}
+
+const MAX_BASE_DIR_LEN: usize = 256;
+
+/// The app's folder in its repository, as a path that can only lead inside
+/// it: relative, and without `..` or `.` parts.
+fn base_dir_path(base_dir: &str) -> Result<&Path, Failure> {
+    use std::path::Component;
+
+    let path = Path::new(base_dir);
+    let confined = !base_dir.is_empty()
+        && base_dir.len() <= MAX_BASE_DIR_LEN
+        && path.components().all(|c| matches!(c, Component::Normal(_)));
+    if confined {
+        Ok(path)
+    } else {
+        Err(Failure::new(
+            "prepare",
+            format!("{base_dir:?} must be a folder inside the repository, like apps/web"),
+        )
+        .with_next_step("Set the app's folder to a path relative to the repository's root."))
+    }
+}
+
+/// Where the image is built from and the job's files go: the repository,
+/// or the app's folder in it. The folder has to be in the repository at
+/// this commit, and a link in the repository can't point it elsewhere on
+/// the machine. Without a repository the job's files are the app, so the
+/// folder is made for them.
+fn build_context(
+    workspace: &Path,
+    base_dir: Option<&Path>,
+    commit: &str,
+    fetched: bool,
+) -> Result<PathBuf, Failure> {
+    let Some(base_dir) = base_dir else {
+        return Ok(workspace.to_path_buf());
+    };
+    let context = workspace.join(base_dir);
+    if !fetched {
+        std::fs::create_dir_all(&context).map_err(|e| {
+            Failure::new(
+                "prepare",
+                format!("could not create {}: {e}", base_dir.display()),
+            )
+        })?;
+        return Ok(context);
+    }
+
+    let missing = || {
+        Failure::new(
+            "fetch",
+            format!(
+                "{} isn't in the repository at {}",
+                base_dir.display(),
+                &commit[..7.min(commit.len())]
+            ),
+        )
+        .with_next_step("Check the app's folder, or push the commit that adds it.")
+    };
+    let root = workspace
+        .canonicalize()
+        .map_err(|e| Failure::new("prepare", format!("could not read the workspace: {e}")))?;
+    let real = context.canonicalize().map_err(|_| missing())?;
+    if !real.starts_with(&root) {
+        return Err(Failure::new(
+            "fetch",
+            format!("{} leads outside the repository", base_dir.display()),
+        ));
+    }
+    if !real.is_dir() {
+        return Err(missing());
+    }
+    Ok(real)
 }
 
 fn write_files(
@@ -610,6 +842,129 @@ mod tests {
     }
 
     #[test]
+    fn build_fingerprints_are_stable_and_follow_every_input() {
+        let spec: DeploySpec = serde_json::from_value(serde_json::json!({
+            "service": "web",
+            "repo": "https://github.com/acme/shop.git",
+            "commit": "a".repeat(40),
+            "files": {".serveros/Dockerfile": "FROM node:22\n"},
+        }))
+        .unwrap();
+        let base = build_fingerprint(&spec);
+        assert_eq!(base, build_fingerprint(&spec.clone()));
+        assert_eq!(base.len(), 64);
+
+        // What the app runs with, not what it's built from.
+        let mut same = spec.clone();
+        same.env.insert("APP_KEY".into(), "x".into());
+        same.domains.push("shop.example.com".into());
+        same.port = Some(3000);
+        assert_eq!(build_fingerprint(&same), base);
+
+        type Change = Box<dyn Fn(&mut DeploySpec)>;
+        let changes: Vec<Change> = vec![
+            Box::new(|s| s.repo.push('x')),
+            Box::new(|s| s.commit = "b".repeat(40)),
+            Box::new(|s| s.dockerfile = Some("Dockerfile".into())),
+            Box::new(|s| s.dockerfile = Some(String::new())),
+            Box::new(|s| {
+                s.files
+                    .insert(".serveros/Dockerfile".into(), "FROM node:20\n".into());
+            }),
+            Box::new(|s| {
+                s.files.insert("extra".into(), String::new());
+            }),
+            Box::new(|s| s.files.clear()),
+            Box::new(|s| s.base_dir = Some("apps/web".into())),
+            Box::new(|s| s.base_dir = Some(String::new())),
+        ];
+        let mut seen = std::collections::BTreeSet::from([base.clone()]);
+        for change in changes {
+            let mut changed = spec.clone();
+            change(&mut changed);
+            assert!(seen.insert(build_fingerprint(&changed)), "{changed:?}");
+        }
+
+        // A file's name and content don't run together.
+        let mut a = spec.clone();
+        a.files = [("ab".to_string(), "c".to_string())].into();
+        let mut b = spec.clone();
+        b.files = [("a".to_string(), "bc".to_string())].into();
+        assert_ne!(build_fingerprint(&a), build_fingerprint(&b));
+    }
+
+    #[test]
+    fn app_folders_must_stay_inside_the_repository() {
+        for good in ["apps/web", "web", "apps/web/", "services/api-v2"] {
+            assert!(base_dir_path(good).is_ok(), "{good:?} was refused");
+        }
+        let long = "a/".repeat(MAX_BASE_DIR_LEN);
+        for bad in [
+            "",
+            "/apps/web",
+            "../web",
+            "apps/../../web",
+            "./web",
+            ".",
+            long.as_str(),
+        ] {
+            let failure = base_dir_path(bad).unwrap_err();
+            assert!(failure.next_step.is_some(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn an_apps_folder_is_its_build_context_and_gets_the_job_files() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join("apps/web")).unwrap();
+        let root = repo.path().canonicalize().unwrap();
+
+        assert_eq!(
+            build_context(repo.path(), None, "abcdef1", true).unwrap(),
+            repo.path()
+        );
+
+        let context =
+            build_context(repo.path(), Some(Path::new("apps/web")), "abcdef1", true).unwrap();
+        assert_eq!(context, root.join("apps/web"));
+        let mut files = std::collections::BTreeMap::new();
+        files.insert(
+            ".serveros/Dockerfile".to_string(),
+            "FROM scratch\n".to_string(),
+        );
+        write_files(&context, &files).unwrap();
+        assert!(root.join("apps/web/.serveros/Dockerfile").is_file());
+        assert!(!root.join(".serveros").exists());
+
+        let missing = build_context(repo.path(), Some(Path::new("apps/api")), "abcdef1234", true)
+            .unwrap_err();
+        assert_eq!(
+            missing.message,
+            "apps/api isn't in the repository at abcdef1"
+        );
+
+        std::fs::write(repo.path().join("README"), "").unwrap();
+        assert!(build_context(repo.path(), Some(Path::new("README")), "abcdef1", true).is_err());
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), repo.path().join("link")).unwrap();
+        let outside =
+            build_context(repo.path(), Some(Path::new("link")), "abcdef1", true).unwrap_err();
+        assert!(outside.message.contains("outside the repository"));
+
+        // No repository: the job's files are the app, so its folder is made.
+        let files_only = tempfile::tempdir().unwrap();
+        let context = build_context(
+            files_only.path(),
+            Some(Path::new("apps/web")),
+            "abcdef1",
+            false,
+        )
+        .unwrap();
+        assert!(context.is_dir());
+    }
+
+    #[test]
     fn redeploying_the_live_commit_does_not_stop_it() {
         let release = |container: &str| Release {
             commit: "a".repeat(40),
@@ -619,16 +974,89 @@ mod tests {
             deployed_at: 0,
             status: "live".into(),
             http: true,
+            compose: false,
         };
         let same = release("serveros-shop-aaaaaaaaaaaa");
         let older = release("serveros-shop-bbbbbbbbbbbb");
 
         assert!(to_drain(Some(&same), "serveros-shop-aaaaaaaaaaaa").is_none());
+        // The live commit deployed again runs beside it, so the old one
+        // is drained like any other.
+        assert_eq!(
+            to_drain(Some(&same), "serveros-shop-aaaaaaaaaaaa-b").map(|r| r.container.as_str()),
+            Some("serveros-shop-aaaaaaaaaaaa")
+        );
         assert_eq!(
             to_drain(Some(&older), "serveros-shop-aaaaaaaaaaaa").map(|r| r.container.as_str()),
             Some("serveros-shop-bbbbbbbbbbbb")
         );
         assert!(to_drain(None, "serveros-shop-aaaaaaaaaaaa").is_none());
+    }
+
+    #[test]
+    fn the_live_commit_deployed_again_starts_beside_itself() {
+        let commit = "a".repeat(40);
+        let release = |slot: &Slot, commit: &str| Release {
+            commit: commit.into(),
+            image: container::image_tag("shop", commit),
+            container: slot.name.clone(),
+            port: slot.port,
+            deployed_at: 0,
+            status: "live".into(),
+            http: true,
+            compose: false,
+        };
+
+        let first = slot_for("shop", &commit, None);
+        assert_eq!(first.name, "serveros-shop-aaaaaaaaaaaa");
+        assert_eq!(first.port, releases::port_for("shop", &commit));
+
+        // Another commit live: the usual name and port.
+        let other = release(&slot_for("shop", &"b".repeat(40), None), &"b".repeat(40));
+        assert_eq!(slot_for("shop", &commit, Some(&other)), first);
+
+        // Itself live: the other slot, then back again.
+        let second = slot_for("shop", &commit, Some(&release(&first, &commit)));
+        assert_eq!(second.name, "serveros-shop-aaaaaaaaaaaa-b");
+        assert_ne!(second.port, first.port);
+        assert!((20_000..30_000).contains(&second.port));
+        assert_eq!(
+            slot_for("shop", &commit, Some(&release(&second, &commit))),
+            first
+        );
+    }
+
+    #[test]
+    fn compose_releases_are_not_rolled_back_by_starting_a_container() {
+        let release = |container: &str, image: &str, compose: bool| Release {
+            commit: "a".repeat(40),
+            image: image.into(),
+            container: container.into(),
+            port: 0,
+            deployed_at: 0,
+            status: "standby".into(),
+            http: false,
+            compose,
+        };
+
+        // Recorded before the flag was kept, and after.
+        for compose in [
+            release("serveros-shop", "serveros-shop", false),
+            release("serveros-shop", "serveros-shop", true),
+        ] {
+            let failure = refuse_compose(Some(&compose)).unwrap_err();
+            assert_eq!(failure.phase, "rollback");
+            assert!(failure.message.contains("deploying the earlier commit"));
+            assert!(failure.next_step.is_some());
+        }
+
+        let container = release(
+            "serveros-shop-aaaaaaaaaaaa",
+            "serveros/shop:aaaaaaaaaaaa",
+            false,
+        );
+        assert!(refuse_compose(Some(&container)).is_ok());
+        assert!(refuse_compose(None).is_ok());
     }
 
     #[test]

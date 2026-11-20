@@ -14,10 +14,23 @@ pub struct Release {
     /// asking it for a page. Releases recorded before this was kept did.
     #[serde(default = "answers_http")]
     pub http: bool,
+    /// A Compose project rather than one container. Releases recorded
+    /// before this was kept are told apart by their container and image
+    /// both being the project's name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compose: bool,
 }
 
 fn answers_http() -> bool {
     true
+}
+
+impl Release {
+    /// Whether this release is a Compose project. Compose recreates the
+    /// stack in place, so there's no stopped container of it to go back to.
+    pub fn is_compose(&self) -> bool {
+        self.compose || self.container == self.image
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -127,6 +140,19 @@ pub fn port_for(service: &str, commit: &str) -> u16 {
     20_000 + (hash % 10_000) as u16
 }
 
+/// The port for a commit's other container, used when it's deployed again
+/// while it's live: the two run side by side until the swap, so it's never
+/// the commit's usual port.
+pub fn alternate_port(service: &str, commit: &str) -> u16 {
+    let usual = port_for(service, commit);
+    let port = port_for(service, &format!("{commit}\nalternate"));
+    if port == usual {
+        20_000 + (port - 20_000 + 1) % 10_000
+    } else {
+        port
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +166,7 @@ mod tests {
             deployed_at: 0,
             status: "live".into(),
             http: true,
+            compose: false,
         }
     }
 
@@ -164,6 +191,29 @@ mod tests {
     }
 
     #[test]
+    fn compose_releases_are_told_apart_old_and_new() {
+        assert!(!release("a").is_compose());
+
+        // Recorded before the flag was kept: the project's name twice.
+        let old: Release = serde_json::from_str(
+            r#"{"commit":"a","image":"serveros-shop","container":"serveros-shop","port":0,"deployed_at":0,"status":"live"}"#,
+        )
+        .unwrap();
+        assert!(old.is_compose());
+        assert!(!old.compose);
+
+        let new = Release {
+            compose: true,
+            ..release("a")
+        };
+        assert!(new.is_compose());
+
+        // A container release's record is written as it was before.
+        let json = serde_json::to_string(&release("a")).unwrap();
+        assert!(!json.contains("compose"));
+    }
+
+    #[test]
     fn ports_are_stable_and_in_range() {
         assert_eq!(port_for("shop", "abc123"), port_for("shop", "abc123"));
         assert_ne!(
@@ -171,6 +221,40 @@ mod tests {
             port_for("shop-staging", "abc123")
         );
         assert!((20_000..30_000).contains(&port_for("shop", "deadbeef")));
+    }
+
+    #[test]
+    fn a_commits_alternate_port_is_stable_in_range_and_not_its_usual_one() {
+        for app in ["shop", "shop-staging", "api", "a"] {
+            for commit in ["abc123", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", "0"] {
+                let port = alternate_port(app, commit);
+                assert_eq!(port, alternate_port(app, commit));
+                assert_ne!(port, port_for(app, commit));
+                assert!((20_000..30_000).contains(&port));
+            }
+        }
+    }
+
+    #[test]
+    fn deploying_a_commit_again_keeps_one_entry_for_it() {
+        let state = State::in_memory().unwrap();
+        let ledger = ReleaseLedger::new(&state);
+        ledger.promote("app", release("a"), 5).unwrap();
+        ledger.promote("app", release("b"), 5).unwrap();
+        let again = Release {
+            container: "serveros-app-b-b".into(),
+            port: alternate_port("app", "b"),
+            ..release("b")
+        };
+        let evicted = ledger.promote("app", again.clone(), 5).unwrap();
+
+        // The entry it replaced isn't evicted: its container is the one the
+        // deploy drains, and the image is the same one.
+        assert!(evicted.is_empty());
+        let all = ledger.load("app");
+        assert_eq!(all.releases.len(), 2);
+        assert_eq!(ledger.current("app").unwrap().container, again.container);
+        assert_eq!(ledger.previous("app").unwrap().commit, "a");
     }
 
     #[test]
