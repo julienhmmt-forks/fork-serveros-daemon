@@ -853,7 +853,13 @@ pub enum Job {
         destination: BackupDestination,
     },
     BackupReceiver {
+        /// The one key to add (panels before key lists).
+        #[serde(default)]
         public_key: String,
+        /// When given, exactly the keys allowed in, replacing any others;
+        /// empty switches the receiver off.
+        #[serde(default)]
+        public_keys: Option<Vec<String>>,
     },
     Restore {
         service: String,

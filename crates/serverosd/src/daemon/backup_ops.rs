@@ -1,26 +1,48 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use daemon_audit::Actor;
 use daemon_backup::remote::{self, S3Target};
 use daemon_backup::{Manifest, Strategy};
+use daemon_capability::{MachineOp, Operation, Request};
 use daemon_jobs::{run_child, Failure, JobContext};
 use daemon_protocol::BackupDestination;
 use daemon_services::ManagedService;
 use serde_json::{json, Value};
 use tokio::process::Command;
+use tracing::{info, warn};
 
 use super::app::App;
 use super::service_ops::container_of;
 
 pub const RECEIVER_USER: &str = "serveros-backups";
+/// The receiver's home, and the jail its SFTP sessions are locked in: owned
+/// by root, so nothing inside can change the jail or the keys that open it.
 const RECEIVER_HOME: &str = "/var/lib/serveros-backups";
+/// Inside the jail, the one folder senders can write to. Sessions start
+/// here, so the relative paths senders use land in it.
+const RECEIVER_DATA: &str = "backups";
 
-const SFTP_SERVERS: &[&str] = &[
-    "/usr/lib/openssh/sftp-server",
-    "/usr/libexec/openssh/sftp-server",
-    "/usr/lib/ssh/sftp-server",
-    "/usr/libexec/sftp-server",
+const SSHD_CONFIG: &str = "/etc/ssh/sshd_config";
+const SSHD_DROP_IN: &str = "/etc/ssh/sshd_config.d/serveros-backups.conf";
+const SSHD_BEGIN: &str = "# BEGIN serveros-backups (managed by serverosd)";
+const SSHD_END: &str = "# END serveros-backups";
+
+const NO_LOGIN: &[&str] = &[
+    "/usr/sbin/nologin",
+    "/sbin/nologin",
+    "/usr/bin/false",
+    "/bin/false",
 ];
+
+/// What a receiver job does to the keys allowed in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReceiverKeys {
+    /// Keep the keys already there and add this one (panels that only send one).
+    Add(String),
+    /// Exactly these keys, and no others; none switches the receiver off.
+    Exactly(Vec<String>),
+}
 
 pub fn secrets(destination: &BackupDestination) -> Vec<String> {
     match destination {
@@ -371,69 +393,39 @@ fn write_private(path: &Path, contents: &str) -> Result<(), Failure> {
         .map_err(|e| Failure::new("upload", format!("{}: {e}", path.display())))
 }
 
-pub async fn receiver(public_key: &str) -> Result<Value, Failure> {
-    if !super::machine::valid_public_key(public_key) {
+pub async fn receiver(keys: ReceiverKeys) -> Result<Value, Failure> {
+    let wanted = match &keys {
+        ReceiverKeys::Add(key) => vec![key.clone()],
+        ReceiverKeys::Exactly(keys) => keys.clone(),
+    };
+    if wanted.iter().any(|k| !super::machine::valid_public_key(k)) {
         return Err(Failure::new(
             "receiver",
             "that is not a public key ServerOS recognises",
         ));
     }
-    let sftp_server = SFTP_SERVERS
-        .iter()
-        .find(|p| Path::new(p).is_file())
-        .ok_or_else(|| {
+    if !supports_chroot_sftp() {
+        return Err(
             Failure::new("receiver", "OpenSSH's SFTP server is not installed")
-                .with_next_step("Install openssh-server on this machine, then try again.")
-        })?;
+                .with_next_step("Install openssh-server on this machine, then try again."),
+        );
+    }
 
     if !user_exists(RECEIVER_USER).await {
         run(
             "useradd",
             &[
                 "--system",
-                "--create-home",
                 "--home-dir",
                 RECEIVER_HOME,
                 "--shell",
-                "/bin/sh",
+                no_login(),
                 RECEIVER_USER,
             ],
         )
         .await?;
     }
-    run("usermod", &["-p", "*", RECEIVER_USER]).await?;
-
-    let (uid, gid, home, _) = daemon_streams::pty::lookup(RECEIVER_USER)
-        .ok_or_else(|| Failure::new("receiver", format!("user {RECEIVER_USER} is missing")))?;
-    let ssh_dir = Path::new(&home).join(".ssh");
-    let file = ssh_dir.join("authorized_keys");
-    std::fs::create_dir_all(&ssh_dir).map_err(|e| Failure::new("receiver", e.to_string()))?;
-
-    let key = public_key
-        .split_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ");
-    let line = format!("restrict,command=\"{sftp_server}\" {key} serveros-backups");
-    let existing = std::fs::read_to_string(&file).unwrap_or_default();
-    if !existing.lines().any(|l| l.contains(&key)) {
-        let mut contents = existing.trim_end().to_string();
-        if !contents.is_empty() {
-            contents.push('\n');
-        }
-        contents.push_str(&line);
-        contents.push('\n');
-        std::fs::write(&file, contents).map_err(|e| Failure::new("receiver", e.to_string()))?;
-    }
-
-    for (path, mode) in [
-        (Path::new(&home), 0o750),
-        (ssh_dir.as_path(), 0o700),
-        (file.as_path(), 0o600),
-    ] {
-        let _ = std::os::unix::fs::chown(path, Some(uid), Some(gid));
-        let _ = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode));
-    }
+    harden(Some(keys)).await?;
 
     let host_key = ["ed25519", "ecdsa", "rsa"].iter().find_map(|kind| {
         std::fs::read_to_string(format!("/etc/ssh/ssh_host_{kind}_key.pub"))
@@ -443,9 +435,272 @@ pub async fn receiver(public_key: &str) -> Result<Value, Failure> {
 
     Ok(json!({
         "user": RECEIVER_USER,
-        "home": home,
+        "home": RECEIVER_HOME,
         "host_key": host_key,
     }))
+}
+
+/// Brings a receiver set up by an older daemon onto the jailed layout, keeping
+/// the keys it has. Runs on start; nothing happens on machines that aren't one.
+pub async fn harden_on_start(app: std::sync::Arc<App>) {
+    if !user_exists(RECEIVER_USER).await {
+        return;
+    }
+    let grant = match app.broker.authorize(Request {
+        actor: Actor::daemon(),
+        operation: Operation::Machine(MachineOp::ManageSshKeys {
+            user: RECEIVER_USER.into(),
+        }),
+        confirmed: false,
+    }) {
+        Ok(grant) => grant,
+        Err(denied) => {
+            warn!(reason = %denied, "not locking the backup receiver into its folder");
+            return;
+        }
+    };
+    let result = harden(None).await;
+    grant.finish(
+        &result.as_ref().map(|_| ()),
+        Some("backup receiver locked into its folder on start"),
+    );
+    match result {
+        Ok(()) => info!("backup receiver is locked into its folder"),
+        Err(e) => warn!(error = %e.message, "couldn't lock the backup receiver into its folder"),
+    }
+}
+
+/// Locks the receiver account into its jail: SFTP only, inside
+/// RECEIVER_HOME, starting in RECEIVER_DATA, with the keys file owned by
+/// root. `keys` changes who's allowed in; None keeps the keys already there.
+async fn harden(keys: Option<ReceiverKeys>) -> Result<(), Failure> {
+    run(
+        "usermod",
+        &["--shell", no_login(), "-p", "*", RECEIVER_USER],
+    )
+    .await?;
+    let (uid, gid, _, _) = daemon_streams::pty::lookup(RECEIVER_USER)
+        .ok_or_else(|| Failure::new("receiver", format!("user {RECEIVER_USER} is missing")))?;
+
+    let home = Path::new(RECEIVER_HOME);
+    let data = home.join(RECEIVER_DATA);
+    let ssh_dir = home.join(".ssh");
+    let file = ssh_dir.join("authorized_keys");
+    let fail = |e: std::io::Error| Failure::new("receiver", e.to_string());
+
+    std::fs::create_dir_all(&data).map_err(fail)?;
+    std::fs::create_dir_all(&ssh_dir).map_err(fail)?;
+    // Backups an older daemon wrote straight into the home move into the
+    // data folder, where senders' paths now resolve.
+    let names: Vec<String> = std::fs::read_dir(home)
+        .map_err(fail)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    for name in entries_to_move(&names) {
+        let target = data.join(&name);
+        if !target.exists() {
+            std::fs::rename(home.join(&name), target).map_err(fail)?;
+        }
+    }
+
+    let existing = std::fs::read_to_string(&file).unwrap_or_default();
+    let contents = authorized_keys(&existing, keys.as_ref());
+    if contents != existing {
+        std::fs::write(&file, contents).map_err(fail)?;
+    }
+
+    // The jail and everything above the data folder belong to root, as sshd
+    // requires for ChrootDirectory; only the data folder is the account's.
+    for (path, owner, mode) in [
+        (home, (0, 0), 0o755),
+        (ssh_dir.as_path(), (0, 0), 0o755),
+        (file.as_path(), (0, 0), 0o644),
+        (data.as_path(), (uid, gid), 0o700),
+    ] {
+        std::os::unix::fs::chown(path, Some(owner.0), Some(owner.1)).map_err(fail)?;
+        std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(mode))
+            .map_err(fail)?;
+    }
+
+    install_sshd_jail().await
+}
+
+/// Writes the Match block that jails the account, as a drop-in when sshd
+/// reads them and at the end of sshd_config when it doesn't, checks it with
+/// `sshd -t` (putting things back if it fails) and reloads sshd.
+async fn install_sshd_jail() -> Result<(), Failure> {
+    let main = std::fs::read_to_string(SSHD_CONFIG).unwrap_or_default();
+    let fail = |e: std::io::Error| Failure::new("receiver", e.to_string());
+
+    let (path, before, after) = if reads_drop_ins(&main) {
+        let before = std::fs::read_to_string(SSHD_DROP_IN).ok();
+        let after = sshd_match_block();
+        (SSHD_DROP_IN, before, after)
+    } else {
+        (SSHD_CONFIG, Some(main.clone()), with_managed_block(&main))
+    };
+    if before.as_deref() == Some(after.as_str()) {
+        return Ok(());
+    }
+
+    if let Some(parent) = Path::new(path).parent() {
+        std::fs::create_dir_all(parent).map_err(fail)?;
+    }
+    std::fs::write(path, &after).map_err(fail)?;
+    let _ = std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o644));
+
+    if let Err(e) = run(sshd_binary(), &["-t"]).await {
+        match before {
+            Some(old) => {
+                let _ = std::fs::write(path, old);
+            }
+            None => {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        return Err(Failure::new(
+            "receiver",
+            "sshd didn't accept the settings that lock backups into their folder, so nothing was changed",
+        )
+        .with_output(vec![e.message.to_string()]));
+    }
+
+    for unit in ["ssh", "sshd"] {
+        let active = Command::new("systemctl")
+            .args(["is-active", "--quiet", unit])
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if active {
+            run("systemctl", &["reload", unit]).await?;
+            break;
+        }
+    }
+    Ok(())
+}
+
+fn sshd_match_block() -> String {
+    format!(
+        "# Backups other machines send here over SFTP: locked into {RECEIVER_HOME},\n\
+         # SFTP only. Written by serverosd; changes are overwritten.\n\
+         Match User {RECEIVER_USER}\n\
+         \x20   ChrootDirectory {RECEIVER_HOME}\n\
+         \x20   ForceCommand internal-sftp -d /{RECEIVER_DATA}\n\
+         \x20   AllowTcpForwarding no\n\
+         \x20   AllowAgentForwarding no\n\
+         \x20   X11Forwarding no\n\
+         \x20   PermitTunnel no\n\
+         \x20   PermitTTY no\n"
+    )
+}
+
+/// sshd_config with the jail's Match block at its end, where a Match block
+/// can't swallow the settings after it, replacing one written before.
+fn with_managed_block(main: &str) -> String {
+    let mut kept = String::new();
+    let mut inside = false;
+    for line in main.lines() {
+        if line.trim() == SSHD_BEGIN {
+            inside = true;
+        } else if line.trim() == SSHD_END {
+            inside = false;
+        } else if !inside {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    format!(
+        "{}\n{SSHD_BEGIN}\n{}{SSHD_END}\n",
+        kept.trim_end(),
+        sshd_match_block()
+    )
+}
+
+/// Whether sshd_config includes /etc/ssh/sshd_config.d/*.conf.
+fn reads_drop_ins(main: &str) -> bool {
+    main.lines().any(|line| {
+        let mut words = line.split_whitespace();
+        words
+            .next()
+            .is_some_and(|w| w.eq_ignore_ascii_case("include"))
+            && words.any(|w| w.contains("sshd_config.d"))
+    })
+}
+
+/// The authorized_keys file for the receiver: each key allowed only SFTP,
+/// in the data folder.
+fn authorized_keys(existing: &str, change: Option<&ReceiverKeys>) -> String {
+    let mut keys: Vec<String> = match change {
+        Some(ReceiverKeys::Exactly(keys)) => keys.iter().map(|k| bare_key(k)).collect(),
+        _ => existing.lines().filter_map(key_in_line).collect(),
+    };
+    if let Some(ReceiverKeys::Add(key)) = change {
+        keys.push(bare_key(key));
+    }
+    let mut seen = std::collections::HashSet::new();
+    keys.retain(|k| !k.is_empty() && seen.insert(k.clone()));
+
+    keys.iter()
+        .map(|key| {
+            format!(
+                "restrict,command=\"internal-sftp -d /{RECEIVER_DATA}\" {key} {RECEIVER_USER}\n"
+            )
+        })
+        .collect()
+}
+
+/// "algorithm base64" from a public key, dropping its comment.
+fn bare_key(key: &str) -> String {
+    key.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+}
+
+/// The key in an authorized_keys line, after any options before it.
+fn key_in_line(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words.iter().enumerate().find_map(|(i, w)| {
+        let candidate = format!("{w} {}", words.get(i + 1).unwrap_or(&""));
+        super::machine::valid_public_key(&candidate).then(|| bare_key(&candidate))
+    })
+}
+
+/// Entries an older daemon left in the home that belong in the data folder:
+/// everything but the keys, the data folder and the account's dotfiles.
+fn entries_to_move(names: &[String]) -> Vec<String> {
+    let mut moving: Vec<String> = names
+        .iter()
+        .filter(|n| n.as_str() != RECEIVER_DATA && !n.starts_with('.'))
+        .cloned()
+        .collect();
+    moving.sort();
+    moving
+}
+
+fn no_login() -> &'static str {
+    NO_LOGIN
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .copied()
+        .unwrap_or("/usr/sbin/nologin")
+}
+
+fn sshd_binary() -> &'static str {
+    ["/usr/sbin/sshd", "/sbin/sshd", "/usr/bin/sshd"]
+        .iter()
+        .find(|p| Path::new(p).is_file())
+        .copied()
+        .unwrap_or("sshd")
+}
+
+/// internal-sftp is built into sshd, so a jail needs no SFTP binary inside
+/// it; sshd itself has to be there.
+fn supports_chroot_sftp() -> bool {
+    Path::new(sshd_binary()).is_file()
 }
 
 async fn user_exists(user: &str) -> bool {
@@ -479,6 +734,138 @@ async fn run(program: &str, args: &[&str]) -> Result<(), Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIObbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    #[test]
+    fn every_key_is_sftp_only_in_the_data_folder() {
+        let written = authorized_keys(
+            "",
+            Some(&ReceiverKeys::Add(format!("{KEY_A} serveros-backups"))),
+        );
+        assert_eq!(
+            written,
+            format!("restrict,command=\"internal-sftp -d /backups\" {KEY_A} serveros-backups\n")
+        );
+    }
+
+    #[test]
+    fn an_exact_list_drops_every_other_key_and_an_empty_one_drops_them_all() {
+        let old =
+            format!("restrict,command=\"/usr/lib/openssh/sftp-server\" {KEY_A} serveros-backups\n");
+        let written = authorized_keys(&old, Some(&ReceiverKeys::Exactly(vec![KEY_B.into()])));
+        assert!(written.contains(KEY_B) && !written.contains(KEY_A));
+        assert_eq!(
+            authorized_keys(&old, Some(&ReceiverKeys::Exactly(vec![]))),
+            ""
+        );
+    }
+
+    #[test]
+    fn adding_keeps_the_keys_there_and_moves_them_into_the_jail() {
+        let old = format!(
+            "restrict,command=\"/usr/lib/openssh/sftp-server\" {KEY_A} serveros-backups\n# a note\n"
+        );
+        let written = authorized_keys(&old, Some(&ReceiverKeys::Add(KEY_B.into())));
+        assert_eq!(written.lines().count(), 2);
+        assert!(written
+            .lines()
+            .all(|l| l.starts_with("restrict,command=\"internal-sftp -d /backups\" ")));
+        assert_eq!(
+            authorized_keys(&written, Some(&ReceiverKeys::Add(KEY_B.into()))),
+            written
+        );
+        assert!(!authorized_keys(&old, None).contains("sftp-server"));
+    }
+
+    #[test]
+    fn the_jail_confines_the_account_to_sftp_in_its_home() {
+        let block = sshd_match_block();
+        assert!(block.contains("Match User serveros-backups\n"));
+        assert!(block.contains("    ChrootDirectory /var/lib/serveros-backups\n"));
+        assert!(block.contains("    ForceCommand internal-sftp -d /backups\n"));
+        assert!(block.contains("    PermitTTY no\n"));
+    }
+
+    #[test]
+    fn without_drop_ins_the_block_goes_at_the_end_once() {
+        let main = "Port 22\nSubsystem sftp /usr/libexec/openssh/sftp-server\n";
+        assert!(!reads_drop_ins(main));
+        assert!(reads_drop_ins(
+            "Include /etc/ssh/sshd_config.d/*.conf\nPort 22\n"
+        ));
+        let once = with_managed_block(main);
+        assert!(once.starts_with(main));
+        assert!(once.trim_end().ends_with(SSHD_END));
+        assert_eq!(with_managed_block(&once), once);
+    }
+
+    /// On a throwaway Linux machine, as root, with openssh-server installed:
+    /// SERVEROS_RECEIVER_E2E_KEY="$(cat key.pub)" cargo test -p serverosd -- --ignored receiver_on_a_real_machine
+    /// Changes users, /var/lib/serveros-backups and sshd's config, so never
+    /// run it anywhere else.
+    #[tokio::test]
+    #[ignore]
+    async fn receiver_on_a_real_machine() {
+        let key = std::env::var("SERVEROS_RECEIVER_E2E_KEY").expect("SERVEROS_RECEIVER_E2E_KEY");
+        // A receiver as an older daemon left it: the backups in the home,
+        // owned by the account, and a key forced to the external sftp-server.
+        run(
+            "useradd",
+            &[
+                "--system",
+                "--create-home",
+                "--home-dir",
+                RECEIVER_HOME,
+                "--shell",
+                "/bin/sh",
+                RECEIVER_USER,
+            ],
+        )
+        .await
+        .unwrap();
+        let home = Path::new(RECEIVER_HOME);
+        std::fs::create_dir_all(home.join("acme/web-1")).unwrap();
+        std::fs::write(home.join("acme/web-1/old.sql"), "old").unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            home.join(".ssh/authorized_keys"),
+            format!("restrict,command=\"/usr/lib/openssh/sftp-server\" {KEY_A} serveros-backups\n"),
+        )
+        .unwrap();
+
+        harden(None).await.unwrap();
+        assert!(home.join("backups/acme/web-1/old.sql").is_file());
+        assert!(!home.join("acme").exists());
+        receiver(ReceiverKeys::Exactly(vec![key.clone()]))
+            .await
+            .unwrap();
+
+        let keys = std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
+        assert!(keys.contains(&bare_key(&key)) && !keys.contains(KEY_A));
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(home).unwrap().uid(), 0);
+        assert_eq!(
+            std::fs::metadata(home.join(".ssh/authorized_keys"))
+                .unwrap()
+                .uid(),
+            0
+        );
+        // Again changes nothing.
+        receiver(ReceiverKeys::Exactly(vec![key])).await.unwrap();
+    }
+
+    #[test]
+    fn older_backups_move_into_the_data_folder_but_keys_and_dotfiles_stay() {
+        let names = [".ssh", ".bashrc", "backups", "acme", "web-1"].map(String::from);
+        assert_eq!(
+            entries_to_move(&names),
+            vec!["acme".to_string(), "web-1".to_string()]
+        );
+    }
 
     #[test]
     fn objects_go_under_the_prefix_service_and_snapshot() {

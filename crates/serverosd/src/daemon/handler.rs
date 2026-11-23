@@ -1197,11 +1197,18 @@ async fn handle(app: Arc<App>, ctx: JobContext) -> Result<Value, Failure> {
             result
         }
 
-        Job::BackupReceiver { public_key } => {
+        Job::BackupReceiver {
+            public_key,
+            public_keys,
+        } => {
             let grant = authorize(Operation::Machine(MachineOp::ManageSshKeys {
                 user: super::backup_ops::RECEIVER_USER.into(),
             }))?;
-            let result = super::backup_ops::receiver(&public_key).await;
+            let keys = match public_keys {
+                Some(keys) => super::backup_ops::ReceiverKeys::Exactly(keys),
+                None => super::backup_ops::ReceiverKeys::Add(public_key),
+            };
+            let result = super::backup_ops::receiver(keys).await;
             grant.finish(&result.as_ref().map(|_| ()), Some("backup receiver"));
             result
         }

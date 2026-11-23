@@ -141,6 +141,7 @@ pub fn run(paths: Paths) -> anyhow::Result<()> {
         tls_ask::serve(Arc::clone(&app));
         maintenance::serve(Arc::clone(&app));
         tokio::spawn(network::restore_all(Arc::clone(&app)));
+        tokio::spawn(backup_ops::harden_on_start(Arc::clone(&app)));
 
         let firewall = app.config.read().unwrap().integrations.firewall;
         ports::restore(firewall, &paths.state_dir).await;
