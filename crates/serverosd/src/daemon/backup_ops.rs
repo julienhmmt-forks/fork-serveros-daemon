@@ -810,7 +810,10 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn receiver_on_a_real_machine() {
-        let key = std::env::var("SERVEROS_RECEIVER_E2E_KEY").expect("SERVEROS_RECEIVER_E2E_KEY");
+        // CI runs ignored tests as root too; this one only runs when asked.
+        let Ok(key) = std::env::var("SERVEROS_RECEIVER_E2E_KEY") else {
+            return;
+        };
         // A receiver as an older daemon left it: the backups in the home,
         // owned by the account, and a key forced to the external sftp-server.
         run(
