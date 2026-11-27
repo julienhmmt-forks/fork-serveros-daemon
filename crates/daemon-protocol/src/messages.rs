@@ -972,7 +972,32 @@ pub enum Job {
         repo: String,
         #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
         git_ref: Option<String>,
+        /// A token for a private HTTPS repository, as a deploy sends it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_token: Option<RepoToken>,
     },
+    /// A repository's files at a commit, without building anything, so the
+    /// panel can tell what kind of app it is on any git host: the commit,
+    /// its files up to three folders deep, and the small files that say how
+    /// an app is built. An SSH address uses the service's deploy key; an
+    /// HTTPS one is read as public or with `repo_token`. Missing `ref`
+    /// means the default branch. Read-only.
+    RepoInspect {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        service: Option<String>,
+        repo: String,
+        #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
+        git_ref: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_dir: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repo_token: Option<RepoToken>,
+    },
+    /// Install Docker Engine with its Compose and Buildx plugins from
+    /// Docker's own package repository (apt on Debian and Ubuntu, dnf on
+    /// Fedora and the RHEL family). Does nothing when Docker already runs
+    /// with both plugins. Needs confirmation; refused in read-only mode.
+    DockerInstall,
     Snapshots {
         service: String,
     },
@@ -1306,6 +1331,106 @@ pub struct DeploySpec {
     /// machine's own, and never stored or logged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub registries: Vec<RegistryLogin>,
+    /// How the app's image is made. Missing builds `dockerfile` (or runs
+    /// `compose_file`), as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<BuildSpec>,
+    /// Named volumes for the app's data, mounted in every release, on top
+    /// of the folders the Dockerfile declares with VOLUME. Each is the
+    /// Docker volume `serveros-<service>-<name>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeMount>,
+    /// Run once in a throwaway container of the new release (same image,
+    /// settings, volumes and network) before it starts serving: migrations,
+    /// say. A non-zero exit or a timeout fails the deploy, and the live
+    /// release keeps serving. Runs as `sh -c <command>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_command: Option<String>,
+    /// Run inside the new container (`sh -c`) once it's live. A failure is
+    /// a warning in the log; the deploy still succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_deploy_command: Option<String>,
+    /// A Docker network the app's container joins, made if missing, with
+    /// the service's name as its address there, so apps on one machine reach
+    /// each other by name. Missing keeps Docker's default bridge, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
+/// How an app's image is made.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BuildSpec {
+    #[serde(default)]
+    pub method: BuildMethod,
+    /// For `image`: what to run, like `ghcr.io/acme/api:1.4`, or pinned as
+    /// `name@sha256:…`. Pulled with the job's `registries`; nothing is
+    /// fetched or built.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+    /// For `dockerfile`: the stage to build (`docker build --target`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Settings the build can read: a Dockerfile's ARGs, or Railpack's build
+    /// environment. Not given to the running app unless also in `env`.
+    /// Never logged, and never put on a command line.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub args: BTreeMap<String, String>,
+    /// For `railpack`: commands that replace the ones it works out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_command: Option<String>,
+    /// Build from scratch: no layer cache, and no reusing an image already
+    /// built for the same commit.
+    #[serde(default)]
+    pub no_cache: bool,
+    /// Fetch the repository's submodules (recursively, shallow).
+    #[serde(default = "default_true")]
+    pub submodules: bool,
+    /// Fetch the repository's Git LFS files.
+    #[serde(default = "default_true")]
+    pub lfs: bool,
+}
+
+impl Default for BuildSpec {
+    fn default() -> Self {
+        Self {
+            method: BuildMethod::default(),
+            image: None,
+            target: None,
+            args: BTreeMap::new(),
+            install_command: None,
+            build_command: None,
+            start_command: None,
+            no_cache: false,
+            submodules: true,
+            lfs: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BuildMethod {
+    /// The repository's Dockerfile (`DeploySpec::dockerfile`).
+    #[default]
+    Dockerfile,
+    /// No Dockerfile: Railpack works out how to build and start the app
+    /// from its files (package.json, requirements.txt, go.mod, …).
+    Railpack,
+    /// A prebuilt image (`BuildSpec::image`).
+    Image,
+}
+
+/// A named volume mounted into an app's container.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeMount {
+    /// `[a-z0-9][a-z0-9_.-]{0,62}`.
+    pub name: String,
+    /// An absolute path in the container.
+    pub path: String,
 }
 
 /// Limits on what an app's container may use.
@@ -1459,12 +1584,23 @@ pub struct SnapshotRef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthCheck {
     pub path: String,
+    /// The status that counts as healthy. 0 means any HTTP response below
+    /// 500: the app answers on its port.
     #[serde(default = "default_expected_status")]
     pub expected_status: u16,
     #[serde(default = "default_health_timeout")]
     pub timeout_secs: u64,
     #[serde(default = "default_health_retries")]
     pub retries: u32,
+    /// Seconds a new release gets to boot before failed tries count against
+    /// `retries`; tries keep running every `interval_secs` during it.
+    /// Missing means none, as before.
+    #[serde(default)]
+    pub start_period_secs: u64,
+    /// Seconds between tries. Missing waits 2, 4, 8, then 16 seconds, as
+    /// before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_secs: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -1700,6 +1836,7 @@ mod tests {
                 service: "web".into(),
                 repo: "git@gitlab.com:acme/web.git".into(),
                 git_ref: Some("main".into()),
+                repo_token: None,
             }
         );
         assert_eq!(serde_json::to_value(&job).unwrap(), raw);
@@ -1707,8 +1844,98 @@ mod tests {
         let raw = serde_json::json!({"type": "resolve_ref", "service": "web", "repo": "x"});
         assert!(matches!(
             serde_json::from_value::<Job>(raw).unwrap(),
-            Job::ResolveRef { git_ref: None, .. }
+            Job::ResolveRef {
+                git_ref: None,
+                repo_token: None,
+                ..
+            }
         ));
+
+        let raw = serde_json::json!({
+            "type": "resolve_ref",
+            "service": "web",
+            "repo": "https://github.com/acme/private.git",
+            "repo_token": "ghs_abc",
+        });
+        let Job::ResolveRef { repo_token, .. } = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a resolve_ref");
+        };
+        assert_eq!(repo_token, Some(RepoToken("ghs_abc".into())));
+    }
+
+    #[test]
+    fn repo_inspect_jobs_need_only_the_repository() {
+        let raw =
+            serde_json::json!({"type": "repo_inspect", "repo": "https://github.com/acme/web.git"});
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        assert_eq!(
+            job,
+            Job::RepoInspect {
+                service: None,
+                repo: "https://github.com/acme/web.git".into(),
+                git_ref: None,
+                base_dir: None,
+                repo_token: None,
+            }
+        );
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
+
+        let raw = serde_json::json!({
+            "type": "repo_inspect",
+            "service": "web",
+            "repo": "git@gitlab.com:acme/web.git",
+            "ref": "release/2",
+            "base_dir": "apps/web",
+            "repo_token": "glpat-x",
+        });
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        let Job::RepoInspect {
+            service,
+            git_ref,
+            base_dir,
+            repo_token,
+            ..
+        } = &job
+        else {
+            panic!("not a repo_inspect");
+        };
+        assert_eq!(service.as_deref(), Some("web"));
+        assert_eq!(git_ref.as_deref(), Some("release/2"));
+        assert_eq!(base_dir.as_deref(), Some("apps/web"));
+        assert_eq!(repo_token, &Some(RepoToken("glpat-x".into())));
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
+    }
+
+    #[test]
+    fn build_settings_fetch_submodules_and_lfs_unless_told_not_to() {
+        let raw = serde_json::json!({
+            "type": "deploy", "service": "web", "commit": "abc",
+            "build": {"method": "railpack", "start_command": "node server.js"},
+        });
+        let Job::Deploy(spec) = serde_json::from_value::<Job>(raw).unwrap() else {
+            panic!("not a deploy");
+        };
+        let build = spec.build.unwrap();
+        assert_eq!(build.method, BuildMethod::Railpack);
+        assert!(build.submodules && build.lfs && !build.no_cache);
+        assert_eq!(build.start_command.as_deref(), Some("node server.js"));
+        assert_eq!(BuildSpec::default().method, BuildMethod::Dockerfile);
+        assert!(BuildSpec::default().submodules && BuildSpec::default().lfs);
+
+        let build: BuildSpec = serde_json::from_value(serde_json::json!({
+            "method": "image", "image": "nginx:alpine", "submodules": false, "lfs": false,
+        }))
+        .unwrap();
+        assert_eq!(build.method, BuildMethod::Image);
+        assert!(!build.submodules && !build.lfs);
+    }
+
+    #[test]
+    fn docker_install_is_a_job_with_no_fields() {
+        let raw = serde_json::json!({"type": "docker_install"});
+        let job = serde_json::from_value::<Job>(raw.clone()).unwrap();
+        assert_eq!(job, Job::DockerInstall);
+        assert_eq!(serde_json::to_value(&job).unwrap(), raw);
     }
 
     #[test]
